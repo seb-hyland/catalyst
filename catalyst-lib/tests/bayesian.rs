@@ -1,5 +1,8 @@
-use burn::{Tensor, backend::Autodiff};
-use catalyst::{train::*, *};
+use burn::{
+    Tensor,
+    backend::{Autodiff, NdArray, ndarray::NdArrayDevice},
+};
+use catalyst_lib::{train::*, *};
 
 mod utils;
 use utils::*;
@@ -91,4 +94,38 @@ fn test_train_gp() {
         final_loss_val < initial_loss_val,
         "Training did not decrease the negative log likelihood"
     );
+}
+
+#[test]
+fn test_batch_selection() {
+    fn f(x: f32, y: f32) -> f32 {
+        -(x - 2.0).powi(2) - (y - 3.0).powi(2) + 10.0
+    }
+
+    // CubeCL bug
+    type B = NdArray;
+    let device = NdArrayDevice::default();
+
+    // Small initial training set
+    let x_train = Tensor::<B, 2>::from_floats([[0.0, 0.0], [1.0, 1.0]], &device);
+    let y_train = Tensor::<B, 1>::from_floats([f(0.0, 0.0), f(1.0, 1.0)], &device);
+
+    // Tiny candidate set
+    let x_candidates = Tensor::<B, 2>::random(
+        [1000, 2],
+        burn::tensor::Distribution::Uniform(0.0, 1.0),
+        &device,
+    );
+
+    // Simple RBF kernel
+    let kernel = Kernel::new(
+        KernelKind::Matern(NuKind::Nu1_2),
+        vec![1.0, 1.0],
+        1.0,
+        &device,
+    );
+
+    // Select batch of 2 points
+    let batch = select_batch(x_train, y_train, &kernel, x_candidates, 10);
+    println!("Selected batch points:\n{batch}");
 }

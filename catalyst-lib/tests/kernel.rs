@@ -1,5 +1,5 @@
 use burn::{Tensor, backend::ndarray::NdArrayDevice};
-use catalyst::*;
+use catalyst_lib::*;
 
 mod utils;
 use utils::*;
@@ -250,7 +250,7 @@ fn test_ard_different_length_scales() {
 
 #[test]
 fn test_kernel_symmetry() {
-    // NdArray for this one, since the WGPU driver has a bug
+    // NdArray for this one, since the CubeCL driver has a bug
     type B = burn::backend::NdArray<f32>;
     let backend = NdArrayDevice::default();
 

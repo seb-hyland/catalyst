@@ -4,7 +4,8 @@ use burn::{
     prelude::*,
     tensor::linalg::{diag, l2_norm},
 };
-use std::marker::PhantomData;
+use libm::erff;
+use std::{f32, marker::PhantomData};
 
 pub mod math;
 pub mod train;
@@ -109,7 +110,7 @@ pub fn gaussian<B: Backend>(
     y_train: Tensor<B, 1>,
     x_test: Tensor<B, 2>,
     kernel: Kernel<B>,
-) -> (Tensor<B, 1>, Tensor<B, 1>) {
+) -> (Tensor<B, 1>, Tensor<B, 2>) {
     // Kernel matrices
     let k_tt = kernel.execute(x_train.clone(), x_train.clone());
     let k_ts = kernel.execute(x_train.clone(), x_test.clone());
@@ -125,10 +126,98 @@ pub fn gaussian<B: Backend>(
         .clone()
         .transpose()
         .matmul(alpha.unsqueeze_dim(1))
-        .squeeze();
+        .squeeze_dim(1);
 
     let v = cholesky_solve_batch(l, k_ts);
-    let predictive_var = diag(k_ss) - v.powi_scalar(2).sum_dim(0).squeeze();
+    let predictive_cov = k_ss - v.clone().transpose().matmul(v);
 
-    (mean, predictive_var)
+    (mean, predictive_cov)
+}
+
+pub fn select_batch<B: Backend>(
+    mut x_train: Tensor<B, 2>,
+    mut y_train: Tensor<B, 1>,
+    model: &Kernel<B>,
+    mut x_candidates: Tensor<B, 2>,
+    batch_size: usize,
+) -> Tensor<B, 2> {
+    let mut selected_points: Vec<Tensor<B, 2>> = Vec::new();
+
+    for _ in 0..batch_size {
+        let expected_improvements = ei_all(
+            x_train.clone(),
+            y_train.clone(),
+            x_candidates.clone(),
+            model,
+        );
+        let (best_candidate_idx, _) = expected_improvements
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
+
+        let best_x = x_candidates.clone().slice(best_candidate_idx);
+        selected_points.push(best_x.clone());
+
+        // Predict its value using the surrogate
+        let (estimated_mu, _cov) = gaussian(
+            x_train.clone(),
+            y_train.clone(),
+            best_x.clone(),
+            model.clone(),
+        );
+        let y_fantasy = estimated_mu.clone();
+        x_train = Tensor::cat(vec![x_train, best_x.clone()], 0);
+        y_train = Tensor::cat(vec![y_train, y_fantasy.clone()], 0);
+
+        let before = x_candidates.clone().slice(0..best_candidate_idx);
+        let after = x_candidates.clone().slice(best_candidate_idx + 1..);
+        x_candidates = Tensor::cat(vec![before, after], 0);
+    }
+
+    Tensor::cat(selected_points, 0)
+}
+
+fn ei_all<B: Backend>(
+    x_train: Tensor<B, 2>,
+    y_train: Tensor<B, 1>,
+    x_candidates: Tensor<B, 2>,
+    model: &Kernel<B>,
+) -> Vec<f32> {
+    let f_best: f32 = y_train
+        .clone()
+        .into_data()
+        .iter()
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let (mu, cov) = gaussian(
+        x_train.clone(),
+        y_train.clone(),
+        x_candidates.clone(),
+        model.clone(),
+    );
+
+    let mu_vec = mu.clone().into_data().to_vec().unwrap();
+    let var_vec = diag::<B, 2, 1, _>(cov).into_data().to_vec().unwrap();
+
+    mu_vec
+        .iter()
+        .zip(var_vec.iter())
+        .map(|(&m, &v)| ei_scalar(m, v, f_best))
+        .collect()
+}
+
+fn ei_scalar(mu: f32, var: f32, f_best: f32) -> f32 {
+    if var <= 0.0 {
+        return 0.0;
+    }
+
+    let improvement = mu - f_best;
+    let sigma = var.sqrt();
+
+    let z = improvement / sigma;
+    let phi = (1.0 / f32::sqrt(2.0 * f32::consts::PI)) * f32::exp(-0.5 * z.powi(2));
+    let cdf = 0.5 * (1.0 + erff(z / f32::consts::SQRT_2));
+
+    improvement * cdf + sigma * phi
 }

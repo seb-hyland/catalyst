@@ -1,5 +1,5 @@
 use burn::Tensor;
-use catalyst::math::*;
+use catalyst_lib::math::*;
 
 mod utils;
 use utils::*;
