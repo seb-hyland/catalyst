@@ -19,14 +19,14 @@ pub struct Kernel<B: Backend> {
     // Hyperparameters
     log_length_scale: Param<Tensor<B, 1>>,
     log_variance: Param<Tensor<B, 1>>,
-
-    _marker: PhantomData<B>,
 }
+
 #[derive(Debug, Clone, Copy, Module)]
 pub enum KernelKind {
     Rbf,
     Matern(NuKind),
 }
+
 #[derive(Debug, Clone, Copy, Module)]
 pub enum NuKind {
     Nu1_2,
@@ -46,7 +46,6 @@ impl<B: Backend> Kernel<B> {
             kind,
             log_length_scale: Param::from_tensor(Tensor::from_floats(log_ls.as_slice(), device)),
             log_variance: Param::from_tensor(Tensor::from_floats([variance.ln()], device)),
-            _marker: PhantomData,
         }
     }
 

@@ -1,9 +1,11 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use eframe::{App, HardwareAcceleration, NativeOptions};
 use egui::{
-    CentralPanel, Color32, FontData, FontDefinitions, FontFamily, Style, ViewportBuilder, Window,
+    CentralPanel, Color32, Direction, FontData, FontDefinitions, FontFamily, Layout, RichText,
+    Vec2, ViewportBuilder, vec2,
 };
+use rfd::FileDialog;
 
 fn main() {
     eframe::run_native(
@@ -21,7 +23,9 @@ fn main() {
 }
 
 #[derive(Default)]
-struct Application {}
+struct Application {
+    picked_file: Option<PathBuf>,
+}
 
 impl App for Application {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -39,12 +43,28 @@ impl App for Application {
             .insert(0, "JetBrainsMono-Regular".to_owned());
         ctx.set_fonts(fonts);
 
-        CentralPanel::default().show(ctx, |ui| {
-            let mut style = Style::default();
-            style.visuals.override_text_color = Some(Color32::WHITE);
+        ctx.style_mut(|style| style.spacing.button_padding = vec2(12.0, 8.0));
 
-            ui.set_style(style);
-            ui.heading("Hello, world!");
+        CentralPanel::default().show(ctx, |ui| {
+            ui.centered_and_justified(|ui| {
+                if ui
+                    .button(
+                        RichText::new("Upload file")
+                            .background_color(Color32::LIGHT_BLUE)
+                            .color(Color32::WHITE)
+                            .size(30.0),
+                    )
+                    .clicked()
+                {
+                    self.picked_file = FileDialog::new().pick_file();
+                };
+            });
+
+            ui.add_space(20.0);
+
+            if let Some(ref file) = self.picked_file {
+                ui.label(format!("File picked: {}", file.display()));
+            }
         });
     }
 }
