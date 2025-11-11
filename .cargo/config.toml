@@ -1,0 +1,2 @@
+[build]
+rustdocflags = ["--html-in-header", "./catalyst-lib/doc_katex.html"]
