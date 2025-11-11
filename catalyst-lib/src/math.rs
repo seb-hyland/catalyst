@@ -1,110 +1,181 @@
 use burn::prelude::*;
+use std::{
+    mem::MaybeUninit,
+    ops::{Bound, RangeBounds},
+};
 
-pub fn cholesky<B: Backend>(tensor: Tensor<B, 2>) -> Tensor<B, 2> {
+/**
+   A raw buffer that may contain chunks of uninitialized memory.
+*/
+pub struct RawBuffer<T>(Vec<MaybeUninit<T>>);
+
+impl<T: Clone> RawBuffer<T> {
+    /**
+       Initialize a buffer of uninitialized memory
+       that can hold `size` items of type T.
+    */
+    pub fn init(size: usize) -> Self {
+        let mut inner = Vec::with_capacity(size);
+        inner.resize_with(size, MaybeUninit::uninit);
+        Self(inner)
+    }
+
+    /**
+       Mutate the `index` item in the buffer,
+       setting it to `element`.
+    */
+    pub fn set(&mut self, index: usize, element: T) {
+        self.0[index] = MaybeUninit::new(element);
+    }
+
+    /**
+       Extract a slice of the buffer bounded by `range`.
+       All items will be cloned, and returned as a [`Vec`] of owned elements.
+
+       # Safety
+       All items in `range` must have been previously initialized.
+    */
+    pub unsafe fn slice_vec<R: RangeBounds<usize>>(&self, range: R) -> Vec<T> {
+        let start = match range.start_bound() {
+            Bound::Included(&s) => s,
+            Bound::Excluded(&s) => s + 1,
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&s) => s + 1,
+            Bound::Excluded(&s) => s,
+            Bound::Unbounded => self.0.len(),
+        };
+
+        self.0[start..end]
+            .iter()
+            .map(|item| unsafe { item.assume_init_ref().clone() })
+            .collect()
+    }
+
+    /**
+        Consumes the buffer and returns it as a [`Vec`] of initialized elements.
+
+        # Safety
+        All items in the buffer must have been previously initialized.
+    */
+    pub unsafe fn into_inner(self) -> Vec<T> {
+        self.0
+            .into_iter()
+            .map(|item| unsafe { item.assume_init() })
+            .collect()
+    }
+}
+
+/// Compute the Cholesky decomposition of a Hermitian, positive-definite matrix
+pub fn cholesky<B: Backend>(a: Tensor<B, 2>) -> Tensor<B, 2> {
     // Check shape
-    let [n, m] = tensor.shape().dims::<2>();
+    let [n, m] = a.shape().dims::<2>();
     assert_eq!(n, m, "Matrix must be square");
 
-    let device = tensor.device();
+    let device = a.device();
     let mut l = Tensor::<B, 2>::zeros([n, n], &device);
 
-    for j in 0..n {
-        // diagonal element
-        let a_jj = tensor.clone().slice([j..j + 1, j..j + 1]); // [1,1]
+    for i in 0..n {
+        const CLAMP: f32 = 1e-12;
+        let a_elem = a.clone().slice([i, i]);
 
-        let mut sum_sq = Tensor::<B, 2>::zeros([1, 1], &device);
-        if j > 0 {
-            let l_row = l.clone().slice([j..j + 1, 0..j]); // [1, j]
-            sum_sq = (l_row.clone() * l_row).sum().reshape([1, 1]);
-        }
+        let diag = if i == 0 {
+            Tensor::sqrt(a_elem.clamp_min(CLAMP))
+        } else {
+            let prev_cols = l.clone().slice(s![i, 0..i]);
+            let diag_inner = a_elem
+                - Tensor::dot(
+                    prev_cols.clone().squeeze_dim(0),
+                    prev_cols.clone().squeeze_dim(0),
+                )
+                .unsqueeze_dim(0);
+            Tensor::sqrt(diag_inner.clamp_min(CLAMP))
+        };
 
-        let diag = a_jj - sum_sq;
-        let diag_val = diag.clone().into_scalar().to_f64();
-        assert!(
-            diag_val > 0.0,
-            "Matrix is not positive definite at position ({}, {})",
-            j,
-            j
-        );
+        l = l.slice_assign([i, i], diag.clone());
 
-        let l_jj = diag.sqrt(); // [1,1]
-        l = l.slice_assign([j..j + 1, j..j + 1], l_jj.clone());
+        // There are still rows below the current
+        if i + 1 < n {
+            let rest_cols_range = (i + 1)..;
+            let a_elem = a.clone().slice(s![rest_cols_range.clone(), i]);
+            let diag = diag.into_scalar();
 
-        // column below diagonal
-        if j < n - 1 {
-            let mut col = tensor.clone().slice([(j + 1)..n, j..j + 1]); // [n-j-1, 1]
+            let l_rest_i = if i == 0 {
+                a_elem / diag
+            } else {
+                let prev_cols = l.clone().slice(s![i, 0..i]);
+                a_elem
+                    - Tensor::matmul(
+                        l.clone().slice(s![rest_cols_range.clone(), 0..i]),
+                        prev_cols.transpose(),
+                    ) / diag
+            };
 
-            if j > 0 {
-                let rows_below = l.clone().slice([(j + 1)..n, 0..j]); // [n-j-1, j]
-                let row_j = l.clone().slice([j..j + 1, 0..j]); // [1, j]
-                let dots = rows_below.matmul(row_j.transpose()); // [n-j-1, 1]
-                col = col - dots;
-            }
-
-            let col = col / l_jj.clone();
-            l = l.slice_assign([(j + 1)..n, j..j + 1], col);
+            l = l.slice_assign(s![rest_cols_range, i], l_rest_i);
         }
     }
 
     l
 }
 
-/// Solves the system Ax = b using Cholesky decomposition
-/// where A = L·L^T has already been decomposed
+/// Solves the system $Ax = b$ using Cholesky decomposition
+/// where $A = L \cdot L^T$ has already been decomposed
 pub fn cholesky_solve<B: Backend>(l: Tensor<B, 2>, b: Tensor<B, 1>) -> Tensor<B, 1> {
-    let n = l.dims()[0];
-    let device = l.device();
+    let [n, _] = l.dims();
 
-    // Forward: L y = b
-    let mut y = Tensor::<B, 1>::zeros([n], &device);
+    // Forward substitution: L y = b
+    let mut y_rows = Vec::with_capacity(n);
     for i in 0..n {
-        // val: [1]
-        let mut val = b.clone().slice(i).reshape([1]);
+        let b_elem = b.clone().slice(i);
+        let diag = l.clone().slice([i, i]).into_scalar();
 
-        if i > 0 {
-            // l_row: [1, i], y_prev: [i, 1] -> matmul -> [1,1]
-            let l_row = l.clone().slice(s![i, 0..i]); // [1, i]
-            let y_prev = y.clone().slice(0..i).reshape([i, 1]); // [i,1]
-            let dot = l_row.matmul(y_prev).reshape([1]); // [1]
-            val = val - dot;
-        }
+        let row = if i == 0 {
+            b_elem.clone() / diag
+        } else {
+            let dot_product = Tensor::dot(
+                l.clone().slice(s![i, 0..i]).squeeze_dim(0),
+                Tensor::cat(y_rows[0..i].to_owned(), 0),
+            );
+            (b_elem - dot_product) / diag
+        };
 
-        let l_ii = l.clone().slice([i, i]).reshape([1]); // [1]
-        let y_i = (val / l_ii).reshape([1]); // [1]
-        y = y.slice_assign(i, y_i);
+        y_rows.insert(i, row);
     }
+    let y = Tensor::cat(y_rows, 0);
 
-    // Backward: L^T x = y
-    let mut x = Tensor::<B, 1>::zeros([n], &device);
+    // Backward substitution: L^T x = y
+    let mut x_rows = RawBuffer::init(n);
     for i in (0..n).rev() {
-        let mut val = y.clone().slice(i).reshape([1]);
+        let y_elem = y.clone().slice(i);
+        let diag = l.clone().slice([i, i]).into_scalar();
 
-        if i < n - 1 {
-            // l_col: [n-i-1, 1], x_rest: [n-i-1, 1]
-            let l_col = l.clone().slice(s![(i + 1)..n, i]); // [n-i-1, 1]
-            let x_rest = x.clone().slice((i + 1)..n).reshape([n - i - 1, 1]);
-            // (L^T row) * x_rest = l_col.transpose() matmul x_rest -> [1,1]
-            let dot = l_col.transpose().matmul(x_rest).reshape([1]);
-            val = val - dot;
-        }
+        let row = if i == n - 1 {
+            y_elem / diag
+        } else {
+            let dot_product = Tensor::dot(
+                l.clone().slice(s![i + 1.., i]).squeeze_dim(1),
+                Tensor::cat(unsafe { x_rows.slice_vec(i + 1..) }, 0),
+            );
+            (y_elem - dot_product) / diag
+        };
 
-        let l_ii = l.clone().slice([i, i]).reshape([1]); // [1]
-        let x_i = (val / l_ii).reshape([1]);
-        x = x.slice_assign(i, x_i);
+        x_rows.set(i, row);
     }
 
-    x
+    Tensor::cat(unsafe { x_rows.into_inner() }, 0)
 }
 
-/// Solve L·L^T X = B where B is 2-D (n x m). Returns X (n x m).
+/// Solve $L \cdot L^T X = B$ where $B$ is $2D$ ($n \times m$). Returns $X$ ($n \times m$).
 pub fn cholesky_solve_batch<B: Backend>(l: Tensor<B, 2>, b: Tensor<B, 2>) -> Tensor<B, 2> {
-    // Solve each column (this is straightforward and correct).
-    let [n, m] = b.dims();
-    let mut cols: Vec<Tensor<B, 1>> = Vec::with_capacity(m);
+    let [_n, m] = b.dims();
+    let mut cols = Vec::with_capacity(m);
+
     for j in 0..m {
-        let col = b.clone().slice(s![0..n, j]).reshape([n]);
+        let col = b.clone().slice(s![.., j]).squeeze_dim(1);
         let x_col = cholesky_solve(l.clone(), col);
         cols.push(x_col);
     }
+
     Tensor::stack(cols, 1)
 }

@@ -3,6 +3,7 @@ use crate::{
     math::{cholesky, cholesky_solve},
 };
 use burn::{
+    grad_clipping::GradientClippingConfig,
     optim::{AdamConfig, GradientsParams, Optimizer as _},
     prelude::*,
     tensor::{backend::AutodiffBackend, linalg::diag},
@@ -15,7 +16,9 @@ pub fn train_gp<B: AutodiffBackend>(
     epochs: usize,
     lr: f64,
 ) -> Kernel<B> {
-    let mut optim = AdamConfig::new().init();
+    let mut optim = AdamConfig::new()
+        .with_grad_clipping(Some(GradientClippingConfig::Value(1.0)))
+        .init();
 
     #[cfg(feature = "visualize")]
     let (mut losses, mut length_scales, mut variances) = (
@@ -37,9 +40,11 @@ pub fn train_gp<B: AutodiffBackend>(
                 .into_data()
                 .to_vec()
                 .expect("Length scales");
+            println!("Length: {ls:?}");
             length_scales.push(ls);
 
             let variance: f32 = model.variance().clone().into_scalar().to_f32();
+            println!("Var: {variance}");
             variances.push(variance);
         }
 

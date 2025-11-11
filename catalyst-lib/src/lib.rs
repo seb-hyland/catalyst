@@ -5,12 +5,12 @@ use burn::{
     tensor::linalg::{diag, l2_norm},
 };
 use libm::erff;
-use std::{f32, marker::PhantomData};
+use std::f32;
 
 pub mod math;
 pub mod train;
 
-const NOISE: f64 = 1e-6;
+const NOISE: f64 = 1e-4;
 
 #[derive(Module, Debug)]
 pub struct Kernel<B: Backend> {
@@ -50,11 +50,11 @@ impl<B: Backend> Kernel<B> {
     }
 
     pub fn length_scale(&self) -> Tensor<B, 1> {
-        self.log_length_scale.val().clone().exp()
+        self.log_length_scale.val().clone().exp().clamp_min(1e-4)
     }
 
     pub fn variance(&self) -> Tensor<B, 1> {
-        self.log_variance.val().clone().exp()
+        self.log_variance.val().clone().exp().clamp_min(1e-6)
     }
 
     pub fn execute(&self, x1: Tensor<B, 2>, x2: Tensor<B, 2>) -> Tensor<B, 2> {
@@ -115,7 +115,7 @@ pub fn gaussian<B: Backend>(
     let k_ts = kernel.execute(x_train.clone(), x_test.clone());
     let k_ss = kernel.execute(x_test.clone(), x_test.clone());
 
-    let n = k_tt.dims()[0];
+    let [n, _] = k_tt.dims();
     // Add noise
     let k_y = k_tt + Tensor::<B, 2>::eye(n, &x_train.device()) * NOISE;
 
@@ -141,13 +141,15 @@ pub fn select_batch<B: Backend>(
     batch_size: usize,
 ) -> Tensor<B, 2> {
     let mut selected_points: Vec<Tensor<B, 2>> = Vec::new();
+    let xi_max = 1.0;
 
-    for _ in 0..batch_size {
+    for i in 0..batch_size {
         let expected_improvements = ei_all(
             x_train.clone(),
             y_train.clone(),
             x_candidates.clone(),
             model,
+            xi_max * i as f32 / batch_size as f32,
         );
         let (best_candidate_idx, _) = expected_improvements
             .iter()
@@ -169,8 +171,19 @@ pub fn select_batch<B: Backend>(
         x_train = Tensor::cat(vec![x_train, best_x.clone()], 0);
         y_train = Tensor::cat(vec![y_train, y_fantasy.clone()], 0);
 
-        let before = x_candidates.clone().slice(0..best_candidate_idx);
-        let after = x_candidates.clone().slice(best_candidate_idx + 1..);
+        let [n_rows, n_cols] = x_candidates.dims();
+        let device = x_train.device();
+
+        let before = if best_candidate_idx != 0 {
+            x_candidates.clone().slice(0..best_candidate_idx)
+        } else {
+            Tensor::empty([0, n_cols], &device)
+        };
+        let after = if best_candidate_idx != n_rows - 1 {
+            x_candidates.clone().slice(best_candidate_idx + 1..)
+        } else {
+            Tensor::empty([0, n_cols], &device)
+        };
         x_candidates = Tensor::cat(vec![before, after], 0);
     }
 
@@ -182,6 +195,7 @@ fn ei_all<B: Backend>(
     y_train: Tensor<B, 1>,
     x_candidates: Tensor<B, 2>,
     model: &Kernel<B>,
+    xi: f32,
 ) -> Vec<f32> {
     let f_best: f32 = y_train
         .clone()
@@ -197,21 +211,21 @@ fn ei_all<B: Backend>(
     );
 
     let mu_vec = mu.clone().into_data().to_vec().unwrap();
-    let var_vec = diag::<B, 2, 1, _>(cov).into_data().to_vec().unwrap();
+    let var_vec = diag::<B, _, 1, _>(cov).into_data().to_vec().unwrap();
 
     mu_vec
         .iter()
         .zip(var_vec.iter())
-        .map(|(&m, &v)| ei_scalar(m, v, f_best))
+        .map(|(&m, &v)| ei_scalar(m, v, f_best, xi))
         .collect()
 }
 
-fn ei_scalar(mu: f32, var: f32, f_best: f32) -> f32 {
+fn ei_scalar(mu: f32, var: f32, f_best: f32, xi: f32) -> f32 {
     if var <= 0.0 {
         return 0.0;
     }
 
-    let improvement = mu - f_best;
+    let improvement = mu - f_best - xi;
     let sigma = var.sqrt();
 
     let z = improvement / sigma;
