@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arrow = { version = "57.0.0", features = ["ffi"] }
 catalyst-lib = { path = "../catalyst-lib" }
 eframe = "0.33.0"
 egui = "0.33.0"
+features = "0.10.0"
 rfd = "0.15.4"
